@@ -1,30 +1,32 @@
 import subprocess
 import threading
 import datetime
-from flask import Flask, request, Response, jsonify
+import os
+import uuid
+from flask import Flask, request, Response, jsonify, send_file
 
 app = Flask(__name__)
 
 LOG_FILE = "yt_dlp_errors.log"
+DOWNLOAD_DIR = "downloads"
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 def log_error(message):
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
-            f.write(message)
-            f.write("\n" + "=" * 80 + "\n")
-    except:
-        pass
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
+        f.write(message)
+        f.write("\n" + "=" * 80 + "\n")
 
 
 @app.route("/")
 def home():
-    return jsonify({"status": "YT-DLP Streaming Server Running"})
+    return jsonify({"status": "YT-DLP Download Server Running"})
 
 
-@app.route("/stream")
-def stream_download():
+@app.route("/download")
+def download_video():
 
     url = request.args.get("url")
     referer = request.args.get("referer")
@@ -33,16 +35,17 @@ def stream_download():
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
 
+    file_id = str(uuid.uuid4())
+    filepath = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
+
     cmd = [
         "yt-dlp",
         url,
-        "-o", "-",                    # stream to stdout
-        "-f", "best",                 # avoid merge (prevents broken pipe)
-        "--hls-use-mpegts",           # stable HLS streaming
-        "--concurrent-fragments", "5",
+        "-f", "best",
+        "--hls-use-mpegts",
+        "-o", filepath,
         "--no-playlist",
-        "--no-check-certificate",
-        "--quiet"
+        "--no-check-certificate"
     ]
 
     if referer:
@@ -53,64 +56,28 @@ def stream_download():
 
     try:
 
-        process = subprocess.Popen(
+        result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0
+            stderr=subprocess.PIPE
         )
 
-        # Capture stderr in background
-        def capture_errors():
-            try:
-                error_output = process.stderr.read().decode("utf-8", errors="ignore")
-                if error_output.strip():
-                    log_error(
-                        "COMMAND:\n"
-                        + " ".join(cmd)
-                        + "\n\nSTDERR:\n"
-                        + error_output
-                    )
-            except Exception as e:
-                log_error("stderr capture failed: " + str(e))
+        if result.returncode != 0:
 
-        threading.Thread(target=capture_errors, daemon=True).start()
+            log_error(
+                "COMMAND:\n"
+                + " ".join(cmd)
+                + "\n\nSTDERR:\n"
+                + result.stderr.decode("utf-8", errors="ignore")
+            )
 
-        def generate():
+            return jsonify({"error": "Download failed"}), 500
 
-            try:
-                while True:
-
-                    chunk = process.stdout.read(1024 * 64)
-
-                    if not chunk:
-                        break
-
-                    yield chunk
-
-            except GeneratorExit:
-                process.kill()
-
-            except Exception as e:
-                log_error("Streaming error: " + str(e))
-                process.kill()
-
-            finally:
-                try:
-                    process.stdout.close()
-                    process.wait()
-                except:
-                    pass
-
-        return Response(
-            generate(),
-            content_type="video/mp4",
-            headers={
-                "Content-Disposition": "attachment; filename=video.mp4",
-                "Transfer-Encoding": "chunked",
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no"
-            }
+        return send_file(
+            filepath,
+            as_attachment=True,
+            download_name="video.mp4",
+            mimetype="video/mp4"
         )
 
     except Exception as e:
@@ -118,25 +85,21 @@ def stream_download():
         log_error("PYTHON ERROR:\n" + str(e))
 
         return jsonify({
-            "error": "Streaming failed",
+            "error": "Download failed",
             "details": str(e)
         }), 500
 
 
 @app.route("/logs")
-def view_logs():
-
+def logs():
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             return Response(f.read(), mimetype="text/plain")
-
-    except FileNotFoundError:
-        return "No logs yet."
+    except:
+        return "No logs yet"
 
 
 if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=5000,
-        threaded=True
-    )
+    import os
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
