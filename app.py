@@ -5,128 +5,89 @@ from flask import Flask, request, Response, jsonify
 
 app = Flask(__name__)
 
-LOG_FILE = "yt_dlp_errors.log"
+LOG_FILE = "download_errors.log"
 
 
-# ==============================
-# Logger
-# ==============================
-def log(message):
+def log(msg):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
-        f.write(message)
-        f.write("\n" + "=" * 80 + "\n")
+        f.write(f"\n[{datetime.datetime.utcnow()}]\n{msg}\n")
 
 
-# ==============================
-# Home
-# ==============================
 @app.route("/")
 def home():
-    return jsonify({"status": "Advanced HLS Downloader Running"})
+    return {"status": "HLS downloader running"}
 
 
-# ==============================
-# Stream Endpoint
-# ==============================
-@app.route("/stream")
-def stream():
+@app.route("/download")
+def download():
     url = request.args.get("url")
     referer = request.args.get("referer")
     ua = request.args.get("ua")
-    cookies = request.args.get("cookies")
 
     if not url:
-        return jsonify({"error": "Missing url parameter"}), 400
+        return jsonify({"error": "Missing url"}), 400
 
     cmd = [
         "yt-dlp",
         url,
-        "-o", "-",                        # output to stdout
+        "-o", "-",
+        "-f", "best",
         "--no-playlist",
         "--downloader", "ffmpeg",
         "--hls-use-mpegts",
-        "--downloader-args", "ffmpeg_i:-allowed_extensions ALL",
-        "--no-check-certificate",
-        "--quiet"
+        "--downloader-args",
+        "ffmpeg:-allowed_extensions ALL",
+        "--downloader-args",
+        "ffmpeg:-protocol_whitelist file,http,https,tcp,tls",
+        "--no-check-certificate"
     ]
 
-    # Headers
     if referer:
         cmd += ["--add-header", f"Referer:{referer}"]
 
     if ua:
         cmd += ["--add-header", f"User-Agent:{ua}"]
 
-    if cookies:
-        cmd += ["--add-header", f"Cookie:{cookies}"]
+    log("COMMAND:\n" + " ".join(cmd))
 
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0
+            stderr=subprocess.PIPE
         )
 
-        # Capture full stderr
-        stderr_output = []
+        def log_errors():
+            err = process.stderr.read().decode("utf-8", errors="ignore")
+            if err.strip():
+                log("STDERR:\n" + err)
 
-        def read_stderr():
-            for line in process.stderr:
-                decoded = line.decode("utf-8", errors="ignore")
-                stderr_output.append(decoded)
+        threading.Thread(target=log_errors, daemon=True).start()
 
-        threading.Thread(target=read_stderr, daemon=True).start()
-
-        def generate():
-            try:
-                while True:
-                    chunk = process.stdout.read(1024 * 64)
-                    if not chunk:
-                        break
-                    yield chunk
-            except Exception as e:
-                log("STREAM ERROR:\n" + str(e))
-            finally:
-                process.stdout.close()
-                process.wait()
-
-                # Log full command + stderr
-                full_log = (
-                    "COMMAND:\n" + " ".join(cmd) +
-                    "\n\nSTDERR:\n" + "".join(stderr_output)
-                )
-                log(full_log)
+        def stream():
+            while True:
+                chunk = process.stdout.read(1024 * 64)
+                if not chunk:
+                    break
+                yield chunk
 
         return Response(
-            generate(),
+            stream(),
             content_type="video/mp2t",
             headers={
-                "Content-Disposition": "attachment; filename=video.ts",
-                "Transfer-Encoding": "chunked"
+                "Content-Disposition": "attachment; filename=video.ts"
             }
         )
 
     except Exception as e:
         log("PYTHON ERROR:\n" + str(e))
-        return jsonify({
-            "error": "Failed to start download",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": str(e)}), 500
 
 
-# ==============================
-# Logs Viewer
-# ==============================
 @app.route("/logs")
 def logs():
     try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
+        with open(LOG_FILE, "r") as f:
             return Response(f.read(), mimetype="text/plain")
-    except FileNotFoundError:
-        return "No logs yet."
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    except:
+        return "No logs yet"
