@@ -1,8 +1,19 @@
-import os
 import subprocess
+import threading
+import datetime
 from flask import Flask, request, Response, jsonify
 
 app = Flask(__name__)
+
+LOG_FILE = "ffmpeg_errors.log"
+
+
+def log_error(message):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
+        f.write(message)
+        f.write("\n" + "="*80 + "\n")
+
 
 @app.route("/")
 def home():
@@ -18,11 +29,11 @@ def stream_download():
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
 
-    # Build FFmpeg command
     cmd = [
         "ffmpeg",
         "-allowed_extensions", "ALL",
         "-protocol_whitelist", "file,http,https,tcp,tls",
+        "-loglevel", "error"
     ]
 
     # Add headers if provided
@@ -39,33 +50,67 @@ def stream_download():
     cmd += [
         "-i", url,
         "-map", "0",
-        "-c", "copy",             # Copy audio/video without re-encoding
-        "-c:s", "mov_text",       # Convert subtitles if exist
-        "-movflags", "frag_keyframe+empty_moov",  # Make MP4 streamable
+        "-c", "copy",
+        "-c:s", "mov_text",
+        "-movflags", "frag_keyframe+empty_moov+faststart",
         "-f", "mp4",
-        "pipe:1"                  # Output to stdout for streaming
+        "pipe:1"
     ]
 
     try:
-        # Launch FFmpeg process
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            bufsize=10**8
         )
 
-        # Stream stdout to browser
+        # 🔥 Background thread to capture full stderr
+        def capture_stderr():
+            full_error = process.stderr.read().decode("utf-8", errors="ignore")
+            if full_error.strip():
+                log_error(
+                    "COMMAND:\n" + " ".join(cmd) +
+                    "\n\nSTDERR:\n" + full_error
+                )
+
+        threading.Thread(target=capture_stderr, daemon=True).start()
+
+        def generate():
+            try:
+                while True:
+                    chunk = process.stdout.read(1024 * 64)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                process.stdout.close()
+                process.wait()
+
         return Response(
-            process.stdout,
+            generate(),
             content_type="video/mp4",
-            headers={"Content-Disposition": "attachment; filename=video.mp4"}
+            headers={
+                "Content-Disposition": "attachment; filename=video.mp4",
+                "Transfer-Encoding": "chunked"
+            }
         )
 
     except Exception as e:
+        log_error("PYTHON ERROR:\n" + str(e))
         return jsonify({
             "error": "Streaming failed",
             "details": str(e)
         }), 500
+
+
+@app.route("/logs")
+def view_logs():
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            return Response(f.read(), mimetype="text/plain")
+    except FileNotFoundError:
+        return "No logs yet."
 
 
 if __name__ == "__main__":
