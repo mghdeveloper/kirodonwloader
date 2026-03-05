@@ -7,11 +7,12 @@ app = Flask(__name__)
 
 LOG_FILE = "yt_dlp_errors.log"
 
+
 def log_error(message):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
         f.write(message)
-        f.write("\n" + "="*80 + "\n")
+        f.write("\n" + "=" * 80 + "\n")
 
 
 @app.route("/")
@@ -28,29 +29,26 @@ def stream_download():
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
 
-    # Build yt-dlp command
     cmd = [
         "yt-dlp",
         url,
-        "-o", "-",               # output to stdout
-        "-f", "bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "--embed-subs",
-        "--write-subs",
-        "--sub-lang", "all",
+        "-o", "-",                       # output to stdout
+        "-f", "best",                    # single muxed stream (fixes broken pipe)
+        "--hls-use-mpegts",              # stable HLS streaming
+        "--concurrent-fragments", "5",   # faster downloads
         "--no-playlist",
         "--no-check-certificate",
         "--quiet"
     ]
 
-    # Add headers
+    # optional headers
     if referer:
         cmd += ["--add-header", f"Referer:{referer}"]
+
     if ua:
         cmd += ["--add-header", f"User-Agent:{ua}"]
 
     try:
-        # Launch yt-dlp process
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -58,28 +56,38 @@ def stream_download():
             bufsize=10**8
         )
 
-        # Background thread to log full yt-dlp stderr
+        # Capture stderr in background for logs
         def capture_stderr():
             try:
                 full_error = process.stderr.read().decode("utf-8", errors="ignore")
                 if full_error.strip():
-                    log_error("COMMAND:\n" + " ".join(cmd) + "\n\nSTDERR:\n" + full_error)
+                    log_error(
+                        "COMMAND:\n"
+                        + " ".join(cmd)
+                        + "\n\nSTDERR:\n"
+                        + full_error
+                    )
             except Exception as e:
                 log_error("Error capturing stderr: " + str(e))
 
         threading.Thread(target=capture_stderr, daemon=True).start()
 
-        # Stream stdout to browser chunk by chunk
+        # Stream output
         def generate():
             try:
                 while True:
-                    chunk = process.stdout.read(1024 * 64)
+                    chunk = process.stdout.read(1024 * 256)
                     if not chunk:
                         break
                     yield chunk
+            except Exception as e:
+                log_error("Streaming error: " + str(e))
             finally:
-                process.stdout.close()
-                process.wait()
+                try:
+                    process.stdout.close()
+                    process.wait()
+                except:
+                    pass
 
         return Response(
             generate(),
@@ -108,4 +116,4 @@ def view_logs():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, threaded=True)
