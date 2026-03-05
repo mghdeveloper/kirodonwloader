@@ -16,7 +16,7 @@ def log_error(message):
 
 @app.route("/")
 def home():
-    return jsonify({"status": "YT-DLP Streaming Downloader Running"})
+    return jsonify({"status": "Stable HLS Streaming Downloader Running"})
 
 
 @app.route("/stream")
@@ -28,29 +28,23 @@ def stream_download():
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
 
-    # Build yt-dlp command
     cmd = [
         "yt-dlp",
         url,
-        "-o", "-",               # output to stdout
-        "-f", "bestvideo+bestaudio/best",
-        "--merge-output-format", "mp4",
-        "--embed-subs",
-        "--write-subs",
-        "--sub-lang", "all",
+        "-o", "-",  # output to stdout
+        "-f", "best",
         "--no-playlist",
-        "--no-check-certificate",
-        "--quiet"
+        "--downloader", "ffmpeg",
+        "--hls-use-mpegts",
+        "--no-check-certificate"
     ]
 
-    # Add headers
     if referer:
         cmd += ["--add-header", f"Referer:{referer}"]
     if ua:
         cmd += ["--add-header", f"User-Agent:{ua}"]
 
     try:
-        # Launch yt-dlp process
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -58,18 +52,14 @@ def stream_download():
             bufsize=10**8
         )
 
-        # Background thread to log full yt-dlp stderr
+        # Log stderr in background
         def capture_stderr():
-            try:
-                full_error = process.stderr.read().decode("utf-8", errors="ignore")
-                if full_error.strip():
-                    log_error("COMMAND:\n" + " ".join(cmd) + "\n\nSTDERR:\n" + full_error)
-            except Exception as e:
-                log_error("Error capturing stderr: " + str(e))
+            full_error = process.stderr.read().decode("utf-8", errors="ignore")
+            if full_error.strip():
+                log_error("COMMAND:\n" + " ".join(cmd) + "\n\nSTDERR:\n" + full_error)
 
         threading.Thread(target=capture_stderr, daemon=True).start()
 
-        # Stream stdout to browser chunk by chunk
         def generate():
             try:
                 while True:
@@ -83,9 +73,9 @@ def stream_download():
 
         return Response(
             generate(),
-            content_type="video/mp4",
+            content_type="video/mp2t",  # MPEG-TS stream
             headers={
-                "Content-Disposition": "attachment; filename=video.mp4",
+                "Content-Disposition": "attachment; filename=video.ts",
                 "Transfer-Encoding": "chunked"
             }
         )
