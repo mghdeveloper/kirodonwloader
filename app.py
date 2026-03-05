@@ -7,23 +7,34 @@ app = Flask(__name__)
 
 LOG_FILE = "yt_dlp_errors.log"
 
-def log_error(message):
+
+# ==============================
+# Logger
+# ==============================
+def log(message):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
         f.write(message)
-        f.write("\n" + "="*80 + "\n")
+        f.write("\n" + "=" * 80 + "\n")
 
 
+# ==============================
+# Home
+# ==============================
 @app.route("/")
 def home():
-    return jsonify({"status": "Stable HLS Streaming Downloader Running"})
+    return jsonify({"status": "Advanced HLS Downloader Running"})
 
 
+# ==============================
+# Stream Endpoint
+# ==============================
 @app.route("/stream")
-def stream_download():
+def stream():
     url = request.args.get("url")
     referer = request.args.get("referer")
     ua = request.args.get("ua")
+    cookies = request.args.get("cookies")
 
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
@@ -31,34 +42,42 @@ def stream_download():
     cmd = [
         "yt-dlp",
         url,
-        "-o", "-",  # output to stdout
-        "-f", "best",
+        "-o", "-",                        # output to stdout
         "--no-playlist",
         "--downloader", "ffmpeg",
         "--hls-use-mpegts",
-        "--no-check-certificate"
+        "--downloader-args", "ffmpeg_i:-allowed_extensions ALL",
+        "--no-check-certificate",
+        "--quiet"
     ]
 
+    # Headers
     if referer:
         cmd += ["--add-header", f"Referer:{referer}"]
+
     if ua:
         cmd += ["--add-header", f"User-Agent:{ua}"]
+
+    if cookies:
+        cmd += ["--add-header", f"Cookie:{cookies}"]
 
     try:
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=10**8
+            bufsize=0
         )
 
-        # Log stderr in background
-        def capture_stderr():
-            full_error = process.stderr.read().decode("utf-8", errors="ignore")
-            if full_error.strip():
-                log_error("COMMAND:\n" + " ".join(cmd) + "\n\nSTDERR:\n" + full_error)
+        # Capture full stderr
+        stderr_output = []
 
-        threading.Thread(target=capture_stderr, daemon=True).start()
+        def read_stderr():
+            for line in process.stderr:
+                decoded = line.decode("utf-8", errors="ignore")
+                stderr_output.append(decoded)
+
+        threading.Thread(target=read_stderr, daemon=True).start()
 
         def generate():
             try:
@@ -67,13 +86,22 @@ def stream_download():
                     if not chunk:
                         break
                     yield chunk
+            except Exception as e:
+                log("STREAM ERROR:\n" + str(e))
             finally:
                 process.stdout.close()
                 process.wait()
 
+                # Log full command + stderr
+                full_log = (
+                    "COMMAND:\n" + " ".join(cmd) +
+                    "\n\nSTDERR:\n" + "".join(stderr_output)
+                )
+                log(full_log)
+
         return Response(
             generate(),
-            content_type="video/mp2t",  # MPEG-TS stream
+            content_type="video/mp2t",
             headers={
                 "Content-Disposition": "attachment; filename=video.ts",
                 "Transfer-Encoding": "chunked"
@@ -81,15 +109,18 @@ def stream_download():
         )
 
     except Exception as e:
-        log_error("PYTHON ERROR:\n" + str(e))
+        log("PYTHON ERROR:\n" + str(e))
         return jsonify({
-            "error": "Streaming failed",
+            "error": "Failed to start download",
             "details": str(e)
         }), 500
 
 
+# ==============================
+# Logs Viewer
+# ==============================
 @app.route("/logs")
-def view_logs():
+def logs():
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             return Response(f.read(), mimetype="text/plain")
