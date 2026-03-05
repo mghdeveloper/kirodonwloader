@@ -9,19 +9,23 @@ LOG_FILE = "yt_dlp_errors.log"
 
 
 def log_error(message):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
-        f.write(message)
-        f.write("\n" + "=" * 80 + "\n")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
+            f.write(message)
+            f.write("\n" + "=" * 80 + "\n")
+    except:
+        pass
 
 
 @app.route("/")
 def home():
-    return jsonify({"status": "YT-DLP Streaming Downloader Running"})
+    return jsonify({"status": "YT-DLP Streaming Server Running"})
 
 
 @app.route("/stream")
 def stream_download():
+
     url = request.args.get("url")
     referer = request.args.get("referer")
     ua = request.args.get("ua")
@@ -32,16 +36,15 @@ def stream_download():
     cmd = [
         "yt-dlp",
         url,
-        "-o", "-",                       # output to stdout
-        "-f", "best",                    # single muxed stream (fixes broken pipe)
-        "--hls-use-mpegts",              # stable HLS streaming
-        "--concurrent-fragments", "5",   # faster downloads
+        "-o", "-",                    # stream to stdout
+        "-f", "best",                 # avoid merge (prevents broken pipe)
+        "--hls-use-mpegts",           # stable HLS streaming
+        "--concurrent-fragments", "5",
         "--no-playlist",
         "--no-check-certificate",
         "--quiet"
     ]
 
-    # optional headers
     if referer:
         cmd += ["--add-header", f"Referer:{referer}"]
 
@@ -49,39 +52,49 @@ def stream_download():
         cmd += ["--add-header", f"User-Agent:{ua}"]
 
     try:
+
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            bufsize=10**8
+            bufsize=0
         )
 
-        # Capture stderr in background for logs
-        def capture_stderr():
+        # Capture stderr in background
+        def capture_errors():
             try:
-                full_error = process.stderr.read().decode("utf-8", errors="ignore")
-                if full_error.strip():
+                error_output = process.stderr.read().decode("utf-8", errors="ignore")
+                if error_output.strip():
                     log_error(
                         "COMMAND:\n"
                         + " ".join(cmd)
                         + "\n\nSTDERR:\n"
-                        + full_error
+                        + error_output
                     )
             except Exception as e:
-                log_error("Error capturing stderr: " + str(e))
+                log_error("stderr capture failed: " + str(e))
 
-        threading.Thread(target=capture_stderr, daemon=True).start()
+        threading.Thread(target=capture_errors, daemon=True).start()
 
-        # Stream output
         def generate():
+
             try:
                 while True:
-                    chunk = process.stdout.read(1024 * 256)
+
+                    chunk = process.stdout.read(1024 * 64)
+
                     if not chunk:
                         break
+
                     yield chunk
+
+            except GeneratorExit:
+                process.kill()
+
             except Exception as e:
                 log_error("Streaming error: " + str(e))
+                process.kill()
+
             finally:
                 try:
                     process.stdout.close()
@@ -94,12 +107,16 @@ def stream_download():
             content_type="video/mp4",
             headers={
                 "Content-Disposition": "attachment; filename=video.mp4",
-                "Transfer-Encoding": "chunked"
+                "Transfer-Encoding": "chunked",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
             }
         )
 
     except Exception as e:
+
         log_error("PYTHON ERROR:\n" + str(e))
+
         return jsonify({
             "error": "Streaming failed",
             "details": str(e)
@@ -108,12 +125,18 @@ def stream_download():
 
 @app.route("/logs")
 def view_logs():
+
     try:
         with open(LOG_FILE, "r", encoding="utf-8") as f:
             return Response(f.read(), mimetype="text/plain")
+
     except FileNotFoundError:
         return "No logs yet."
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        threaded=True
+    )
