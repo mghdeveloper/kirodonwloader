@@ -11,10 +11,6 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 
 def extract_m3u8(url):
-    """
-    If URL already contains .m3u8 return it,
-    otherwise try to extract from page source.
-    """
     if ".m3u8" in url:
         return url
 
@@ -24,8 +20,8 @@ def extract_m3u8(url):
             start = r.text.find("http", r.text.find(".m3u8") - 200)
             end = r.text.find(".m3u8") + 5
             return r.text[start:end]
-    except:
-        pass
+    except Exception as e:
+        return None
 
     return None
 
@@ -33,6 +29,9 @@ def extract_m3u8(url):
 @app.route("/download")
 def download():
     url = request.args.get("url")
+    referer = request.args.get("referer")  # optional
+    user_agent = request.args.get("ua")    # optional
+
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
 
@@ -42,19 +41,48 @@ def download():
 
     output_file = os.path.join(DOWNLOAD_FOLDER, f"{uuid.uuid4()}.mp4")
 
+    headers = []
+    if referer:
+        headers.append(f"Referer: {referer}")
+    if user_agent:
+        headers.append(f"User-Agent: {user_agent}")
+
+    header_string = "\\r\\n".join(headers) if headers else ""
+
     cmd = [
         "ffmpeg",
+        "-headers", header_string,
         "-i", m3u8_url,
+        "-map", "0",
         "-c", "copy",
-        "-c:s", "mov_text",  # integrate subtitles if exist
+        "-c:s", "mov_text",
+        "-loglevel", "error",
         output_file
     ]
 
     try:
-        subprocess.run(cmd, check=True)
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+
+        if result.returncode != 0:
+            return jsonify({
+                "error": "Download failed",
+                "ffmpeg_stderr": result.stderr,
+                "ffmpeg_stdout": result.stdout,
+                "command": " ".join(cmd)
+            }), 500
+
         return send_file(output_file, as_attachment=True)
-    except subprocess.CalledProcessError:
-        return jsonify({"error": "Download failed"}), 500
+
+    except Exception as e:
+        return jsonify({
+            "error": "Server exception",
+            "details": str(e)
+        }), 500
 
 
 @app.route("/")
