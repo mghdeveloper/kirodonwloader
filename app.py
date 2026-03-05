@@ -1,7 +1,6 @@
 import os
-import subprocess
 import uuid
-import requests
+import subprocess
 from flask import Flask, request, jsonify, send_file
 
 app = Flask(__name__)
@@ -10,84 +9,100 @@ DOWNLOAD_FOLDER = "downloads"
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 
-def extract_m3u8(url):
-    if ".m3u8" in url:
-        return url
+def run_command(cmd):
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    return result.returncode, result.stdout, result.stderr
 
-    try:
-        r = requests.get(url, timeout=10)
-        if ".m3u8" in r.text:
-            start = r.text.find("http", r.text.find(".m3u8") - 200)
-            end = r.text.find(".m3u8") + 5
-            return r.text[start:end]
-    except Exception as e:
-        return None
 
-    return None
+@app.route("/")
+def home():
+    return jsonify({"status": "Advanced M3U8 Downloader Running"})
 
 
 @app.route("/download")
 def download():
     url = request.args.get("url")
-    referer = request.args.get("referer")  # optional
-    user_agent = request.args.get("ua")    # optional
+    referer = request.args.get("referer")
+    user_agent = request.args.get("ua")
 
     if not url:
         return jsonify({"error": "Missing url parameter"}), 400
 
-    m3u8_url = extract_m3u8(url)
-    if not m3u8_url:
-        return jsonify({"error": "No m3u8 found"}), 400
+    file_id = str(uuid.uuid4())
+    output_path = os.path.join(DOWNLOAD_FOLDER, f"{file_id}.mp4")
 
-    output_file = os.path.join(DOWNLOAD_FOLDER, f"{uuid.uuid4()}.mp4")
+    ############################################
+    # 🔥 STEP 1: Try yt-dlp (Best Method)
+    ############################################
 
-    headers = []
+    ytdlp_cmd = [
+        "yt-dlp",
+        url,
+        "-o", output_path,
+        "--merge-output-format", "mp4",
+        "--embed-subs",
+        "--write-subs",
+        "--sub-lang", "all",
+        "--no-playlist"
+    ]
+
     if referer:
-        headers.append(f"Referer: {referer}")
+        ytdlp_cmd += ["--add-header", f"Referer:{referer}"]
     if user_agent:
-        headers.append(f"User-Agent: {user_agent}")
+        ytdlp_cmd += ["--add-header", f"User-Agent:{user_agent}"]
 
-    header_string = "\\r\\n".join(headers) if headers else ""
+    code, out, err = run_command(ytdlp_cmd)
 
-    cmd = [
+    if code == 0 and os.path.exists(output_path):
+        return send_file(output_path, as_attachment=True)
+
+    ############################################
+    # 🔥 STEP 2: Fallback to Raw FFmpeg
+    ############################################
+
+    ffmpeg_cmd = [
         "ffmpeg",
-        "-headers", header_string,
-        "-i", m3u8_url,
+        "-allowed_extensions", "ALL",
+        "-protocol_whitelist", "file,http,https,tcp,tls",
+        "-i", url,
         "-map", "0",
         "-c", "copy",
         "-c:s", "mov_text",
-        "-loglevel", "error",
-        output_file
+        output_path
     ]
 
-    try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+    if referer or user_agent:
+        headers = []
+        if referer:
+            headers.append(f"Referer: {referer}")
+        if user_agent:
+            headers.append(f"User-Agent: {user_agent}")
+        header_string = "\\r\\n".join(headers)
 
-        if result.returncode != 0:
-            return jsonify({
-                "error": "Download failed",
-                "ffmpeg_stderr": result.stderr,
-                "ffmpeg_stdout": result.stdout,
-                "command": " ".join(cmd)
-            }), 500
+        ffmpeg_cmd.insert(1, "-headers")
+        ffmpeg_cmd.insert(2, header_string)
 
-        return send_file(output_file, as_attachment=True)
+    code2, out2, err2 = run_command(ffmpeg_cmd)
 
-    except Exception as e:
-        return jsonify({
-            "error": "Server exception",
-            "details": str(e)
-        }), 500
+    if code2 == 0 and os.path.exists(output_path):
+        return send_file(output_path, as_attachment=True)
 
+    ############################################
+    # ❌ If Both Fail
+    ############################################
 
-@app.route("/")
-def home():
-    return jsonify({"status": "M3U8 Downloader API running"})
+    return jsonify({
+        "error": "Download failed",
+        "yt_dlp_error": err,
+        "ffmpeg_error": err2,
+        "yt_dlp_command": " ".join(ytdlp_cmd),
+        "ffmpeg_command": " ".join(ffmpeg_cmd)
+    }), 500
 
 
 if __name__ == "__main__":
