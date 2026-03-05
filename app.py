@@ -2,50 +2,48 @@ import subprocess
 import threading
 import datetime
 import os
-import uuid
-from flask import Flask, request, Response, jsonify, send_file
+from flask import Flask, request, Response, jsonify
 
 app = Flask(__name__)
 
 LOG_FILE = "yt_dlp_errors.log"
-DOWNLOAD_DIR = "downloads"
-
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 def log_error(message):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
-        f.write(message)
-        f.write("\n" + "=" * 80 + "\n")
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.datetime.utcnow()} UTC]\n")
+            f.write(message)
+            f.write("\n" + "="*80 + "\n")
+    except:
+        pass
 
 
 @app.route("/")
 def home():
-    return jsonify({"status": "YT-DLP Download Server Running"})
+    return jsonify({"status": "Kiro Downloader Python Server Running"})
 
 
-@app.route("/download")
-def download_video():
+@app.route("/stream")
+def stream():
 
     url = request.args.get("url")
     referer = request.args.get("referer")
     ua = request.args.get("ua")
 
     if not url:
-        return jsonify({"error": "Missing url parameter"}), 400
-
-    file_id = str(uuid.uuid4())
-    filepath = os.path.join(DOWNLOAD_DIR, f"{file_id}.mp4")
+        return jsonify({"error": "Missing url"}), 400
 
     cmd = [
         "yt-dlp",
         url,
+        "-o", "-",
         "-f", "best",
         "--hls-use-mpegts",
-        "-o", filepath,
+        "--concurrent-fragments", "5",
         "--no-playlist",
-        "--no-check-certificate"
+        "--no-check-certificate",
+        "--quiet"
     ]
 
     if referer:
@@ -56,50 +54,60 @@ def download_video():
 
     try:
 
-        result = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
+            bufsize=0
         )
 
-        if result.returncode != 0:
+        def capture_stderr():
+            err = process.stderr.read().decode("utf-8", errors="ignore")
+            if err.strip():
+                log_error("COMMAND:\n" + " ".join(cmd) + "\n\nSTDERR:\n" + err)
 
-            log_error(
-                "COMMAND:\n"
-                + " ".join(cmd)
-                + "\n\nSTDERR:\n"
-                + result.stderr.decode("utf-8", errors="ignore")
-            )
+        threading.Thread(target=capture_stderr, daemon=True).start()
 
-            return jsonify({"error": "Download failed"}), 500
+        def generate():
 
-        return send_file(
-            filepath,
-            as_attachment=True,
-            download_name="video.mp4",
-            mimetype="video/mp4"
+            try:
+                while True:
+
+                    chunk = process.stdout.read(1024 * 256)
+
+                    if not chunk:
+                        break
+
+                    yield chunk
+
+            finally:
+                try:
+                    process.kill()
+                except:
+                    pass
+
+        return Response(
+            generate(),
+            content_type="video/mp4",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no"
+            }
         )
 
     except Exception as e:
 
-        log_error("PYTHON ERROR:\n" + str(e))
+        log_error(str(e))
 
-        return jsonify({
-            "error": "Download failed",
-            "details": str(e)
-        }), 500
-
-
-@app.route("/logs")
-def logs():
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            return Response(f.read(), mimetype="text/plain")
-    except:
-        return "No logs yet"
+        return jsonify({"error": "stream failed"}), 500
 
 
 if __name__ == "__main__":
-    import os
+
     port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
