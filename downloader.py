@@ -4,7 +4,7 @@ import subprocess
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-MAX_THREADS = 32
+MAX_THREADS = 16
 
 
 defaultHeaders = {
@@ -26,14 +26,14 @@ defaultHeaders = {
 
 def segment_headers(url):
 
-    hostHeader = urlparse(url).netloc
+    host = urlparse(url).netloc
 
     return {
         "Accept": "*/*",
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
-        "Host": hostHeader,
+        "Host": host,
         "Origin": "https://megacloud.blog",
         "Referer": "https://megacloud.blog/",
         "sec-ch-ua": "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"",
@@ -48,10 +48,16 @@ def segment_headers(url):
 
 def convert_m3u8(url, output, tasks, task_id):
 
-    temp = f"tmp_{task_id}"
-    os.makedirs(temp, exist_ok=True)
+    print("Fetching playlist:", url)
+
+    temp_dir = os.path.abspath(f"tmp_{task_id}")
+    os.makedirs(temp_dir, exist_ok=True)
 
     r = requests.get(url, headers=defaultHeaders)
+
+    if r.status_code != 200:
+        raise Exception(f"M3U8 request failed {r.status_code}")
+
     playlist = r.text.splitlines()
 
     segments = []
@@ -62,43 +68,106 @@ def convert_m3u8(url, output, tasks, task_id):
 
     total = len(segments)
 
-    def download(i, seg):
+    print("Total segments:", total)
 
-        path = f"{temp}/{i}.ts"
+    if total == 0:
+        raise Exception("No segments found in playlist")
 
-        res = requests.get(seg, headers=segment_headers(seg), stream=True)
+    def download_segment(i, seg_url):
 
-        with open(path, "wb") as f:
-            for chunk in res.iter_content(8192):
-                if chunk:
-                    f.write(chunk)
+        try:
 
-        return i
+            headers = segment_headers(seg_url)
+
+            r = requests.get(seg_url, headers=headers, stream=True, timeout=20)
+
+            if r.status_code != 200:
+                print(f"[SEGMENT ERROR] {seg_url} -> {r.status_code}")
+                return False
+
+            path = os.path.join(temp_dir, f"{i}.ts")
+
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(8192):
+                    if chunk:
+                        f.write(chunk)
+
+            return True
+
+        except Exception as e:
+
+            print(f"[DOWNLOAD ERROR] {seg_url}")
+            print(e)
+            return False
+
 
     done = 0
+    success = 0
 
     with ThreadPoolExecutor(MAX_THREADS) as exe:
 
-        futures = [exe.submit(download, i, s) for i, s in enumerate(segments)]
+        futures = {
+            exe.submit(download_segment, i, seg): i
+            for i, seg in enumerate(segments)
+        }
 
-        for f in as_completed(futures):
+        for future in as_completed(futures):
 
             done += 1
-            tasks[task_id]["progress"] = int((done / total) * 100)
 
-    with open(f"{temp}/list.txt", "w") as f:
+            if future.result():
+                success += 1
+
+            progress = int((done / total) * 100)
+
+            tasks[task_id]["progress"] = progress
+
+            print(f"Progress: {done}/{total} ({progress}%)")
+
+
+    print("Segments downloaded:", success, "/", total)
+
+    if success == 0:
+        raise Exception("All segments failed")
+
+    list_file = os.path.join(temp_dir, "list.txt")
+
+    with open(list_file, "w") as f:
         for i in range(total):
-            f.write(f"file '{temp}/{i}.ts'\n")
+            seg_path = os.path.abspath(os.path.join(temp_dir, f"{i}.ts"))
+            if os.path.exists(seg_path):
+                f.write(f"file '{seg_path}'\n")
 
-    subprocess.run([
+    output = os.path.abspath(output)
+
+    print("Merging with ffmpeg...")
+
+    result = subprocess.run([
         "ffmpeg",
-        "-loglevel", "error",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", f"{temp}/list.txt",
-        "-c", "copy",
+        "-loglevel",
+        "error",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_file,
+        "-c",
+        "copy",
         output
-    ])
+    ], capture_output=True)
+
+    if result.returncode != 0:
+
+        print("FFMPEG ERROR:")
+        print(result.stderr.decode())
+
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["error"] = result.stderr.decode()
+
+        return
+
+    print("MP4 created:", output)
 
     tasks[task_id]["status"] = "done"
     tasks[task_id]["progress"] = 100
