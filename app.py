@@ -1,10 +1,14 @@
 import requests
 import subprocess
 import threading
+import queue
 from flask import Flask, request, Response, abort
 from urllib.parse import urljoin
 
 app = Flask(__name__)
+
+THREADS = 4
+
 
 def read_logs(pipe):
     for line in iter(pipe.readline, b''):
@@ -27,9 +31,39 @@ def parse_m3u8(url, headers):
         if line and not line.startswith("#"):
             segments.append(urljoin(url, line))
 
-    print("[INFO] Segments found:", len(segments), flush=True)
+    print("[INFO] Segments:", len(segments), flush=True)
 
     return segments
+
+
+def download_worker(seg_queue, out_queue, headers):
+
+    session = requests.Session()
+
+    while True:
+
+        item = seg_queue.get()
+
+        if item is None:
+            break
+
+        index, url = item
+
+        try:
+
+            r = session.get(url, headers=headers, stream=True)
+
+            data = b''.join(r.iter_content(8192))
+
+            out_queue.put((index, data))
+
+            print(f"[SEGMENT] OK {index}", flush=True)
+
+        except Exception as e:
+
+            print(f"[SEGMENT] FAIL {index} {e}", flush=True)
+
+        seg_queue.task_done()
 
 
 def stream_video(m3u8_url, referer, ua):
@@ -41,12 +75,35 @@ def stream_video(m3u8_url, referer, ua):
 
     segments = parse_m3u8(m3u8_url, headers)
 
+    seg_queue = queue.Queue()
+    out_queue = queue.Queue()
+
+    for i, seg in enumerate(segments):
+        seg_queue.put((i, seg))
+
+    workers = []
+
+    for _ in range(THREADS):
+
+        t = threading.Thread(
+            target=download_worker,
+            args=(seg_queue, out_queue, headers),
+            daemon=True
+        )
+
+        t.start()
+        workers.append(t)
+
     cmd = [
         "ffmpeg",
-        "-loglevel", "info",
+        "-loglevel", "error",
         "-i", "pipe:0",
+
         "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+
         "-movflags", "frag_keyframe+empty_moov+faststart",
+
         "-f", "mp4",
         "pipe:1"
     ]
@@ -60,25 +117,41 @@ def stream_video(m3u8_url, referer, ua):
 
     threading.Thread(target=read_logs, args=(process.stderr,), daemon=True).start()
 
-    def feed_segments():
+    def feed():
 
-        for i, seg in enumerate(segments):
+        received = {}
 
-            print(f"[SEGMENT] Downloading {i+1}/{len(segments)}", flush=True)
+        next_index = 0
 
-            r = requests.get(seg, headers=headers, stream=True)
+        while next_index < len(segments):
 
-            for chunk in r.iter_content(8192):
-                process.stdin.write(chunk)
+            idx, data = out_queue.get()
+
+            received[idx] = data
+
+            while next_index in received:
+
+                try:
+                    process.stdin.write(received[next_index])
+                except BrokenPipeError:
+                    print("[ERROR] FFmpeg pipe closed", flush=True)
+                    return
+
+                del received[next_index]
+
+                next_index += 1
 
         process.stdin.close()
 
-    threading.Thread(target=feed_segments, daemon=True).start()
+    threading.Thread(target=feed, daemon=True).start()
 
     while True:
+
         chunk = process.stdout.read(65536)
+
         if not chunk:
             break
+
         yield chunk
 
     print("[INFO] Stream finished", flush=True)
@@ -86,7 +159,7 @@ def stream_video(m3u8_url, referer, ua):
 
 @app.route("/")
 def home():
-    return "Kiro Proxy Downloader Ready"
+    return "Kiro Downloader Ready"
 
 
 @app.route("/download")
@@ -99,8 +172,7 @@ def download():
     if not url:
         abort(400, "Missing url")
 
-    print("[INFO] Download request received", flush=True)
-    print("[INFO] M3U8:", url, flush=True)
+    print("[INFO] Download request:", url, flush=True)
 
     return Response(
         stream_video(url, referer, ua),
