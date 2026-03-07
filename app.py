@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import sys
 from flask import Flask, request, Response, abort
 
@@ -7,76 +8,74 @@ app = Flask(__name__)
 FFMPEG = "ffmpeg"
 
 
+def log_reader(pipe):
+    """Read ffmpeg logs continuously"""
+    for line in iter(pipe.readline, b''):
+        try:
+            decoded = line.decode("utf-8", errors="ignore").strip()
+            if decoded:
+                print("[FFMPEG]", decoded, flush=True)
+        except:
+            pass
+
+
 def ffmpeg_stream(url, referer, ua):
 
     headers = f"Referer: {referer}\r\nUser-Agent: {ua}\r\n"
 
     cmd = [
         FFMPEG,
-        "-loglevel", "info",  # لعرض progress
+        "-loglevel", "info",
         "-headers", headers,
         "-i", url,
-        "-map", "0:v:0?",
-        "-map", "0:a:0?",
         "-c", "copy",
-        "-movflags", "frag_keyframe+empty_moov+faststart",
+        "-movflags", "frag_keyframe+empty_moov",
         "-f", "mp4",
         "-"
     ]
 
-    print(f"[INFO] Starting download: {url}")
+    print("[INFO] Running command:", " ".join(cmd), flush=True)
+
     process = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=10**6
+        stderr=subprocess.PIPE
     )
 
-    def stream():
-        try:
-            while True:
-                chunk = process.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
+    # قراءة logs في thread منفصل
+    threading.Thread(target=log_reader, args=(process.stderr,), daemon=True).start()
 
-                # قراءة stderr لعرض progress
-                err_line = process.stderr.readline()
-                if err_line:
-                    line = err_line.decode(errors="ignore").strip()
-                    if "frame=" in line or "size=" in line:
-                        print(f"[PROGRESS] {line}")
-                    elif "404" in line or "failed" in line.lower():
-                        print(f"[ERROR] {line}", file=sys.stderr)
-        finally:
-            process.kill()
-            print("[INFO] Download finished / process killed")
+    while True:
+        chunk = process.stdout.read(65536)
+        if not chunk:
+            break
+        yield chunk
 
-    return stream()
+    print("[INFO] Stream finished", flush=True)
 
 
 @app.route("/")
 def home():
-    return "Kiro Streaming Downloader Ready"
+    return "Downloader ready"
 
 
 @app.route("/download")
 def download():
+
     url = request.args.get("url")
     referer = request.args.get("referer", "")
     ua = request.args.get("ua", "Mozilla/5.0")
 
     if not url:
-        abort(400, "Missing url parameter")
+        abort(400, "Missing url")
 
-    print(f"[INFO] Request received for URL: {url}")
+    print("[INFO] Download request:", url, flush=True)
 
     return Response(
         ffmpeg_stream(url, referer, ua),
         headers={
             "Content-Type": "video/mp4",
-            "Content-Disposition": "attachment; filename=video.mp4",
-            "Cache-Control": "no-cache"
+            "Content-Disposition": "attachment; filename=video.mp4"
         }
     )
 
