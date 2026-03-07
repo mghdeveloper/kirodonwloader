@@ -1,70 +1,54 @@
 import os
-import subprocess
 import uuid
-from flask import Flask, request, Response, jsonify, send_file
+from flask import Flask, request, render_template, jsonify, send_file
+from downloader import convert_m3u8
 
 app = Flask(__name__)
 
-TEMP_DIR = "/tmp/videos"
-os.makedirs(TEMP_DIR, exist_ok=True)
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+tasks = {}
+
+@app.route("/")
+def home():
+    return render_template("index.html")
 
 
-def convert_to_mp4(m3u8, referer, ua):
+@app.route("/convert", methods=["POST"])
+def convert():
 
-    vid = str(uuid.uuid4())
-    out = f"{TEMP_DIR}/{vid}.mp4"
+    m3u8_url = request.json["url"]
 
-    cmd = [
-        "ffmpeg",
-        "-loglevel", "error",
-        "-headers", f"Referer: {referer}\r\nUser-Agent: {ua}\r\n",
-        "-i", m3u8,
-        "-c", "copy",
-        "-bsf:a", "aac_adtstoasc",
-        "-movflags", "faststart",
-        out
-    ]
+    task_id = str(uuid.uuid4())
+    output = f"{DOWNLOAD_DIR}/{task_id}.mp4"
 
-    subprocess.run(cmd)
+    tasks[task_id] = {
+        "progress": 0,
+        "status": "downloading",
+        "file": output
+    }
 
-    return vid, out
+    def run():
+        convert_m3u8(m3u8_url, output, tasks, task_id)
 
+    import threading
+    threading.Thread(target=run).start()
 
-@app.route("/start")
-def start():
-
-    url = request.args.get("url")
-    referer = request.args.get("referer", "")
-    ua = request.args.get("ua", "Mozilla/5.0")
-
-    vid, path = convert_to_mp4(url, referer, ua)
-
-    size = os.path.getsize(path)
-
-    return jsonify({
-        "id": vid,
-        "size": size
-    })
+    return jsonify({"task_id": task_id})
 
 
-@app.route("/chunk")
-def chunk():
+@app.route("/progress/<task_id>")
+def progress(task_id):
+    return jsonify(tasks.get(task_id, {}))
 
-    vid = request.args.get("id")
-    start = int(request.args.get("start", 0))
-    length = int(request.args.get("length", 1048576))
 
-    path = f"{TEMP_DIR}/{vid}.mp4"
+@app.route("/download/<task_id>")
+def download(task_id):
 
-    if not os.path.exists(path):
-        return "file not ready", 404
+    file = tasks[task_id]["file"]
 
-    with open(path, "rb") as f:
-
-        f.seek(start)
-        data = f.read(length)
-
-    return Response(data, mimetype="application/octet-stream")
+    return send_file(file, as_attachment=True)
 
 
 if __name__ == "__main__":
