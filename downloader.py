@@ -4,7 +4,7 @@ import aiohttp
 import subprocess
 from urllib.parse import urljoin
 
-MAX_CONCURRENT = 12
+MAX_CONCURRENT = 20
 
 
 def normalize_url(url):
@@ -18,21 +18,43 @@ async def fetch_text(session, url):
         return await r.text()
 
 
-async def fetch_segment(session, url):
+async def fetch_segment(session, url, retries=3):
 
-    try:
-        async with session.get(url) as r:
+    for attempt in range(retries):
 
-            if r.status != 200:
+        try:
+            async with session.get(url) as r:
+
+                if r.status == 200:
+                    return await r.read()
+
                 print("[SEGMENT ERROR]", url, r.status)
-                return None
 
-            return await r.read()
+        except Exception as e:
 
-    except Exception as e:
+            print("[SEGMENT FAILED]", url, e)
 
-        print("[SEGMENT FAILED]", url, e)
-        return None
+        await asyncio.sleep(1)
+
+    return None
+
+
+async def worker(name, queue, session, results):
+
+    while True:
+
+        item = await queue.get()
+
+        if item is None:
+            break
+
+        index, url = item
+
+        data = await fetch_segment(session, url)
+
+        results[index] = data
+
+        queue.task_done()
 
 
 async def download_all(m3u8_url, output, tasks, task_id):
@@ -54,33 +76,50 @@ async def download_all(m3u8_url, output, tasks, task_id):
         segments = []
 
         for line in lines:
-
             if line and not line.startswith("#"):
-
-                seg = urljoin(m3u8_url, line)
-
-                segments.append(seg)
+                segments.append(urljoin(m3u8_url, line))
 
         total = len(segments)
 
         print("Segments found:", total)
 
-        ts_file = output.replace(".mp4", ".ts")
+        queue = asyncio.Queue()
 
-        with open(ts_file, "wb") as outfile:
+        results = [None] * total
 
-            for i, seg in enumerate(segments):
+        for i, seg in enumerate(segments):
+            await queue.put((i, seg))
 
-                data = await fetch_segment(session, seg)
+        workers = []
 
-                if data:
-                    outfile.write(data)
+        for i in range(MAX_CONCURRENT):
+            task = asyncio.create_task(worker(i, queue, session, results))
+            workers.append(task)
 
-                progress = int((i + 1) / total * 100)
+        await queue.join()
 
-                tasks[task_id]["progress"] = progress
+        for _ in workers:
+            await queue.put(None)
 
-                print(f"Progress {i+1}/{total} ({progress}%)")
+        await asyncio.gather(*workers)
+
+    ts_file = output.replace(".mp4", ".ts")
+
+    print("Writing TS file")
+
+    with open(ts_file, "wb") as outfile:
+
+        for i, data in enumerate(results):
+
+            if data:
+                outfile.write(data)
+
+            progress = int((i + 1) / total * 100)
+
+            tasks[task_id]["progress"] = progress
+
+            if i % 20 == 0:
+                print(f"Progress {i}/{total} ({progress}%)")
 
     print("Converting TS → MP4")
 
