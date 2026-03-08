@@ -2,3 +2,4 @@ flask
 requests
 gunicorn
 httpx[http2]
+aiohttp
